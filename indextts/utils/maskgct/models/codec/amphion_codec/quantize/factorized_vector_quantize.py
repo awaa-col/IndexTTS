@@ -68,6 +68,9 @@ class FactorizedVectorQuantize(nn.Module):
         z_e: torch.Tensor[B x D x T]
             Projected latents (continuous representation of input before quantization)
         """
+        # === MASKER'S FIX: Ensure all submodules are on the same device as the input ===
+        self.in_project.to(z.device)
+        self.out_project.to(z.device)
 
         # Factorized codes project input into low-dimensional space if self.input_dim != self.codebook_dim
         z_e = self.in_project(z)
@@ -94,14 +97,15 @@ class FactorizedVectorQuantize(nn.Module):
         return z_q, commit_loss, codebook_loss, indices, z_e
 
     def embed_code(self, embed_id):
-        return F.embedding(embed_id, self.codebook.weight)
+        weight = self.codebook.weight.to(embed_id.device)
+        return F.embedding(embed_id, weight)
 
     def decode_code(self, embed_id):
         return self.embed_code(embed_id).transpose(1, 2)
 
     def decode_latents(self, latents):
         encodings = rearrange(latents, "b d t -> (b t) d")
-        codebook = self.codebook.weight
+        codebook = self.codebook.weight.to(latents.device)
 
         # L2 normalize encodings and codebook
         if self.use_l2_normlize:
@@ -123,17 +127,18 @@ class FactorizedVectorQuantize(nn.Module):
     def vq2emb(self, vq, out_proj=True):
         emb = self.decode_code(vq)
         if out_proj:
+            # === MASKER'S FIX: Ensure the projection layer is on the correct device ===
+            self.out_project.to(vq.device)
             emb = self.out_project(emb)
         return emb
 
     def latent2dist(self, latents):
         encodings = rearrange(latents, "b d t -> (b t) d")
-        codebook = self.codebook.weight
+        codebook = self.codebook.weight.to(latents.device)
 
         # L2 normalize encodings and codebook
         if self.use_l2_normlize:
             encodings = F.normalize(encodings)
-            codebook = F.normalize(codebook)
 
         # Compute euclidean distance between encodings and codebook,
         # if use_l2_normlize is True, the distance is equal to cosine distance

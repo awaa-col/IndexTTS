@@ -437,6 +437,16 @@ class MyModel(nn.Module):
         x = self.models['gpt_layer'](x)
         return x
 
+    def to(self, device):
+        # This is a custom .to() method to ensure that the freqs_cis buffer in the transformer gets moved to the correct device.
+        # This is required for CPU offloading to work correctly.
+        super().to(device)
+        if hasattr(self, 'models') and 'cfm' in self.models:
+            transformer = self.models['cfm'].estimator.transformer
+            if hasattr(transformer, 'freqs_cis') and transformer.freqs_cis is not None:
+                transformer.freqs_cis = transformer.freqs_cis.to(device)
+        return self
+
 
 
 def build_model(args, stage="DiT"):

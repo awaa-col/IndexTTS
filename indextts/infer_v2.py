@@ -35,10 +35,15 @@ from transformers import SeamlessM4TFeatureExtractor
 import random
 import torch.nn.functional as F
 
+def torch_gc():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False
+            use_cuda_kernel=None,use_deepspeed=False, cpu_offload=False
     ):
         """
         Args:
@@ -48,6 +53,7 @@ class IndexTTS2:
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
             use_deepspeed (bool): whether to use DeepSpeed or not.
+            cpu_offload (bool): whether to offload models to CPU to save VRAM.
         """
         if device is not None:
             self.device = device
@@ -71,12 +77,15 @@ class IndexTTS2:
             self.use_cuda_kernel = False
             print(">> Be patient, it may take a while to run in CPU mode.")
 
+        self.cpu_offload = cpu_offload and self.device not in ['cpu', 'mps']
+        self.model_device = 'cpu' if self.cpu_offload else self.device
+
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
         self.dtype = torch.float16 if self.use_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
-        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path), device=self.model_device)
 
         self.gpt = UnifiedVoice(**self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
@@ -111,7 +120,7 @@ class IndexTTS2:
         self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
             os.path.join(self.model_dir, self.cfg.w2v_stat))
-        self.semantic_model = self.semantic_model.to(self.device)
+        self.semantic_model = self.semantic_model.to(self.model_device)
         self.semantic_model.eval()
         self.semantic_mean = self.semantic_mean.to(self.device)
         self.semantic_std = self.semantic_std.to(self.device)
@@ -119,7 +128,7 @@ class IndexTTS2:
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
         semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
         safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
-        self.semantic_codec = semantic_codec.to(self.device)
+        self.semantic_codec = semantic_codec.to(self.model_device)
         self.semantic_codec.eval()
         print('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
 
@@ -133,7 +142,7 @@ class IndexTTS2:
             ignore_modules=[],
             is_distributed=False,
         )
-        self.s2mel = s2mel.to(self.device)
+        self.s2mel = s2mel.to(self.model_device)
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
         self.s2mel.eval()
         print(">> s2mel weights restored from:", s2mel_path)
@@ -144,13 +153,13 @@ class IndexTTS2:
         )
         campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
         campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
-        self.campplus_model = campplus_model.to(self.device)
+        self.campplus_model = campplus_model.to(self.model_device)
         self.campplus_model.eval()
         print(">> campplus_model weights restored from:", campplus_ckpt_path)
 
         bigvgan_name = self.cfg.vocoder.name
         self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
-        self.bigvgan = self.bigvgan.to(self.device)
+        self.bigvgan = self.bigvgan.to(self.model_device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
         print(">> bigvgan weights restored from:", bigvgan_name)
@@ -183,6 +192,9 @@ class IndexTTS2:
             "center": False
         }
         self.mel_fn = lambda x: mel_spectrogram(x, **mel_fn_args)
+
+        if self.cpu_offload:
+            print(">> CPU offloading is enabled. Models will be moved to CPU after use.")
 
         # 缓存参考音频：
         self.cache_spk_cond = None
@@ -292,6 +304,21 @@ class IndexTTS2:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
 
+    def _move_model_to_device(self, model_name):
+        if not self.cpu_offload:
+            return
+        # print(f">> Moving {model_name} to {self.device}")
+        model = getattr(self, model_name)
+        setattr(self, model_name, model.to(self.device))
+
+    def _move_model_to_cpu(self, model_name):
+        if not self.cpu_offload:
+            return
+        # print(f">> Moving {model_name} to CPU")
+        model = getattr(self, model_name)
+        setattr(self, model_name, model.to('cpu'))
+        torch_gc()
+
     # 原始推理模式
     def infer(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=1.0,
@@ -316,7 +343,10 @@ class IndexTTS2:
             # automatically generate emotion vectors from text prompt
             if emo_text is None:
                 emo_text = text  # use main text prompt
+            self.qwen_emo.model.to(self.device)
             emo_dict = self.qwen_emo.inference(emo_text)
+            self.qwen_emo.model.to('cpu')
+            torch_gc()
             print(f"detected emotion vectors from text: {emo_dict}")
             # convert ordered dict to list of vectors; the order is VERY important!
             emo_vector = list(emo_dict.values())
@@ -340,19 +370,29 @@ class IndexTTS2:
 
         # 如果参考音频改变了，才需要重新生成, 提升速度
         if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+            self.cache_spk_cond = None
+            self.cache_s2mel_style = None
+            self.cache_s2mel_prompt = None
+            self.cache_mel = None
+            torch_gc()
+
             audio, sr = librosa.load(spk_audio_prompt)
             audio = torch.tensor(audio).unsqueeze(0)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
 
+            self._move_model_to_device('semantic_model')
             inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
             input_features = inputs["input_features"]
             attention_mask = inputs["attention_mask"]
             input_features = input_features.to(self.device)
             attention_mask = attention_mask.to(self.device)
             spk_cond_emb = self.get_emb(input_features, attention_mask)
+            self._move_model_to_cpu('semantic_model')
 
+            self._move_model_to_device('semantic_codec')
             _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+            self._move_model_to_cpu('semantic_codec')
             ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
             ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
             feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
@@ -360,12 +400,16 @@ class IndexTTS2:
                                                      dither=0,
                                                      sample_frequency=16000)
             feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
+            self._move_model_to_device('campplus_model')
             style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
-
+            self._move_model_to_cpu('campplus_model')
+            
+            self._move_model_to_device('s2mel')
             prompt_condition = self.s2mel.models['length_regulator'](S_ref,
                                                                      ylens=ref_target_lengths,
                                                                      n_quantizers=3,
                                                                      f0=None)[0]
+            self._move_model_to_cpu('s2mel')
 
             self.cache_spk_cond = spk_cond_emb
             self.cache_s2mel_style = style
@@ -392,13 +436,18 @@ class IndexTTS2:
             emovec_mat = emovec_mat.unsqueeze(0)
 
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+            self.cache_emo_cond = None
+            torch_gc()
+
             emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
             emo_attention_mask = emo_inputs["attention_mask"]
             emo_input_features = emo_input_features.to(self.device)
             emo_attention_mask = emo_attention_mask.to(self.device)
+            self._move_model_to_device('semantic_model')
             emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+            self._move_model_to_cpu('semantic_model')
 
             self.cache_emo_cond = emo_cond_emb
             self.cache_emo_audio_prompt = emo_audio_prompt
@@ -533,6 +582,8 @@ class IndexTTS2:
                     m_start_time = time.perf_counter()
                     diffusion_steps = 25
                     inference_cfg_rate = 0.7
+                    self._move_model_to_device('s2mel')
+                    self._move_model_to_device('semantic_codec')
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
@@ -551,11 +602,15 @@ class IndexTTS2:
                                                                    inference_cfg_rate=inference_cfg_rate)
                     vc_target = vc_target[:, :, ref_mel.size(-1):]
                     s2mel_time += time.perf_counter() - m_start_time
+                    self._move_model_to_cpu('s2mel')
+                    self._move_model_to_cpu('semantic_codec')
 
                     m_start_time = time.perf_counter()
+                    self._move_model_to_device('bigvgan')
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                     print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
+                    self._move_model_to_cpu('bigvgan')
                     wav = wav.squeeze(1)
 
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
@@ -605,7 +660,7 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, device='cpu'):
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -613,6 +668,9 @@ class QwenEmotion:
             torch_dtype="float16",  # "auto"
             device_map="auto"
         )
+        if device == 'cpu':
+            self.model = self.model.to('cpu')
+
         self.prompt = "文本情感分类"
         self.cn_key_to_en = {
             "高兴": "happy",
